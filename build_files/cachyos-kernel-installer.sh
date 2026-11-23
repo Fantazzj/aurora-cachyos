@@ -1,81 +1,51 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
-# Sostituisce il kernel Fedora con quello CachyOS nell'immagine Aurora/bootc.
-# Da eseguire durante la build dell'immagine, come root.
-#
-# Nota Secure Boot: questo script NON firma vmlinuz. Per avviare con Secure
-# Boot attivo occorre aggiungere una fase di firma e registrare la chiave MOK;
-# altrimenti disattivare Secure Boot nel firmware.
+log() { printf '[cachyos-kernel] %s\n' "$*"; }
+err() { printf '[cachyos-kernel] Error: %s\n' "$*" >&2; }
 
-KERNEL_COPR="bieszczaders/kernel-cachyos"
-KERNEL_PACKAGES=(
-    kernel-cachyos
-    kernel-cachyos-core
-    kernel-cachyos-modules
-    kernel-cachyos-devel-matched
-)
+if [ "$(id -u)" -ne 0 ]; then
+    err "Run this script as root."
+    exit 1
+fi
 
-KERNEL_HOOKS=(
-    /usr/lib/kernel/install.d/05-rpmostree.install
-    /usr/lib/kernel/install.d/50-dracut.install
-)
-KERNEL_BOOT_SNAPSHOT=""
-HOOKS_DISABLED=0
+COPR_REPO="bieszczaders/kernel-cachyos"
+KERNEL_PKG="kernel-cachyos"
+KERNEL_DEVEL_PKG="kernel-cachyos-devel-matched"
+KERNEL_PACKAGES="kernel-cachyos kernel-cachyos-core kernel-cachyos-modules kernel-cachyos-devel-matched"
 
 restore_kernel_install_hooks() {
-    local hook
-    for hook in "${KERNEL_HOOKS[@]}"; do
-        if [[ -f "${hook}.bak" ]]; then
-            mv -f "${hook}.bak" "${hook}"
-        fi
+    for _f in \
+        /usr/lib/kernel/install.d/05-rpmostree.install \
+        /usr/lib/kernel/install.d/50-dracut.install
+    do
+        [ -f "${_f}.bak" ] && mv -f "${_f}.bak" "${_f}"
     done
-    HOOKS_DISABLED=0
 }
 
 cleanup() {
     restore_kernel_install_hooks
-    if [[ -n "${KERNEL_BOOT_SNAPSHOT}" ]]; then
-        rm -f "${KERNEL_BOOT_SNAPSHOT}"
+}
+
+trap cleanup 0
+
+log "Temporarily disabling kernel install hooks."
+for _f in \
+    /usr/lib/kernel/install.d/05-rpmostree.install \
+    /usr/lib/kernel/install.d/50-dracut.install
+do
+    [ -f "${_f}" ] || continue
+    if [ -e "${_f}.bak" ]; then
+        err "Backup already exists: ${_f}.bak"
+        exit 1
     fi
-}
-trap cleanup EXIT
+    mv "${_f}" "${_f}.bak"
+    printf '#!/bin/sh\nexit 0\n' >"${_f}"
+    chmod +x "${_f}"
+done
 
-disable_kernel_install_hooks() {
-    local hook
-
-    for hook in "${KERNEL_HOOKS[@]}"; do
-        [[ -f "${hook}" ]] || continue
-
-        if [[ -e "${hook}.bak" ]]; then
-            echo "Errore: esiste già il backup ${hook}.bak" >&2
-            return 1
-        fi
-
-        mv "${hook}" "${hook}.bak"
-        printf '%s\n' '#!/bin/sh' 'exit 0' > "${hook}"
-        chmod 0755 "${hook}"
-    done
-
-    HOOKS_DISABLED=1
-}
-
-echo "::group::Installazione degli strumenti DNF"
-dnf5 install -y dnf5-plugins
-echo "::endgroup::"
-
-echo "::group::Sostituzione del kernel con CachyOS"
-
-disable_kernel_install_hooks
-
-# Durante la transazione kernel-install potrebbe scrivere file in /boot.
-# Conserviamo ciò che era presente per rimuovere soltanto i nuovi elementi.
-KERNEL_BOOT_SNAPSHOT="$(mktemp)"
-find /boot -mindepth 1 -maxdepth 1 -printf '%f\n' | sort \
-    > "${KERNEL_BOOT_SNAPSHOT}"
-
-echo "Rimozione dei pacchetti kernel Fedora"
-dnf5 remove -y \
+log "Removing the default Fedora kernel packages."
+dnf -y remove \
     kernel \
     kernel-core \
     kernel-modules \
@@ -83,76 +53,27 @@ dnf5 remove -y \
     kernel-modules-extra \
     kernel-devel \
     kernel-devel-matched || true
+rm -rf /usr/lib/modules/* || true
 
-# L'immagine usa il kernel CachyOS al posto dei moduli del kernel base.
-rm -rf /usr/lib/modules/*
+log "Enabling COPR repository: ${COPR_REPO}"
+dnf -y copr enable "${COPR_REPO}"
 
-echo "Abilitazione del COPR ${KERNEL_COPR}"
-dnf5 -y copr enable "${KERNEL_COPR}"
+log "Installing CachyOS kernel packages (NVIDIA and Secure Boot signing are not configured)."
+# Intentional word splitting: this is a fixed list of package names.
+# shellcheck disable=SC2086
+dnf -y install ${KERNEL_PACKAGES}
 
-echo "Installazione: ${KERNEL_PACKAGES[*]}"
-dnf5 install -y "${KERNEL_PACKAGES[@]}"
-
-mapfile -t KERNEL_VERSIONS < <(
-    find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n'
-)
-
-if (( ${#KERNEL_VERSIONS[@]} != 1 )); then
-    printf 'Atteso un solo kernel in /usr/lib/modules; trovati %d: %s\n' \
-        "${#KERNEL_VERSIONS[@]}" "${KERNEL_VERSIONS[*]}" >&2
+KERNEL_VERSION=$(rpm -q "${KERNEL_PKG}" --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort -V | tail -n 1)
+if [ -z "${KERNEL_VERSION}" ]; then
+    err "Could not determine the installed CachyOS kernel version."
     exit 1
 fi
-
-KERNEL_VERSION="${KERNEL_VERSIONS[0]}"
-echo "Kernel installato: ${KERNEL_VERSION}"
+log "Installed kernel version: ${KERNEL_VERSION}"
 
 restore_kernel_install_hooks
+trap - 0
 
-NEW_BOOT_ENTRIES=()
-while IFS= read -r entry; do
-    [[ -n "${entry}" ]] && NEW_BOOT_ENTRIES+=("${entry}")
-done < <(
-    comm -13 \
-        "${KERNEL_BOOT_SNAPSHOT}" \
-        <(find /boot -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
-)
+log "Removing kernel build headers after package installation."
+dnf -y remove "${KERNEL_DEVEL_PKG}" || true
 
-if (( ${#NEW_BOOT_ENTRIES[@]} )); then
-    echo "Pulizia degli elementi creati in /boot: ${NEW_BOOT_ENTRIES[*]}"
-    for entry in "${NEW_BOOT_ENTRIES[@]}"; do
-        rm -rf -- "/boot/${entry}"
-    done
-fi
-
-rm -f "${KERNEL_BOOT_SNAPSHOT}"
-KERNEL_BOOT_SNAPSHOT=""
-
-# Il kernel di un'immagine bootc deve avere l'initramfs nella directory
-# dei moduli. Gli hook sono stati disattivati durante la transazione, quindi
-# lo generiamo esplicitamente con la configurazione dracut dell'immagine.
-INITRAMFS="/usr/lib/modules/${KERNEL_VERSION}/initramfs.img"
-
-echo "Generazione dell'initramfs: ${INITRAMFS}"
-DRACUT_NO_XATTR=1 dracut \
-    --no-hostonly \
-    --kver "${KERNEL_VERSION}" \
-    --reproducible \
-    --add ostree \
-    --force "${INITRAMFS}"
-
-if [[ ! -s "${INITRAMFS}" ]]; then
-    echo "Errore: initramfs mancante o vuoto: ${INITRAMFS}" >&2
-    exit 1
-fi
-
-chmod 0600 "${INITRAMFS}"
-if command -v restorecon >/dev/null 2>&1; then
-    restorecon "${INITRAMFS}" 2>/dev/null || true
-fi
-
-# Il COPR serve solo durante la build: i pacchetti installati restano
-# nell'immagine, ma la repo non viene lasciata abilitata sul sistema.
-rm -f /etc/yum.repos.d/_copr:copr.fedorainfracloud.org:bieszczaders:*.repo
-
-echo "Kernel CachyOS ${KERNEL_VERSION} e initramfs installati"
-echo "::endgroup::"
+log "CachyOS kernel installation complete. NVIDIA and Secure Boot signing were not installed or configured."
