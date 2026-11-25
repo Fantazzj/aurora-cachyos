@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# Thanks to https://github.com/daniel-g-carrasco/margine-image
+# Margine image build — common helpers and environment.
+# Sourced by every NN-<area>/install.sh script.
+#
+# Split out of the monolithic build.sh on 2026-06-06 (audit §8 rec #22).
+# The orchestrator at build.sh just dispatches to /ctx/[1-9][0-9]-*/
+# install.sh in lexicographic order; each script sources this file.
+
+set -euo pipefail
+
+log() { printf '[margine-build] %s\n' "$*"; }
+err() { printf '[margine-build] ERROR: %s\n' "$*" >&2; }
+
+# retry_curl <url> <output_path> — fetch with the same brownout-tolerance
+# the kernel-cachyos COPR install uses. Branding asset pulls from
+# raw.githubusercontent.com can fail transiently (5xx, DNS blip,
+# GitHub Pages cold-start); without retry a single hiccup costs us a
+# 25-min rebuild near the end. 5 attempts, 30-150s exponential backoff.
+retry_curl() {
+  local url="$1" out="$2"
+  local attempt=1 max=5
+  while :; do
+    if curl --fail --silent --show-error -L "$url" -o "$out"; then
+      return 0
+    fi
+    if (( attempt >= max )); then
+      log "retry_curl FAILED after $max attempts: $url"
+      return 1
+    fi
+    local backoff=$(( attempt * 30 ))
+    log "retry_curl attempt $attempt failed for $url; sleeping ${backoff}s"
+    sleep $backoff
+    attempt=$(( attempt + 1 ))
+  done
+}
+
+# retry_curl_strict <url> <output_path> — same retry behaviour as
+# retry_curl, but ABORTS the build if the asset is missing or empty
+# after all attempts. Use only for assets without which the image is
+# broken at first boot (welcome screen logo, About-panel logo). Silent
+# failure of these has shipped to user-visible regressions twice
+# (2026-06-04 welcome page dinosaur, 2026-06-06 logo absent), so
+# fail-loud is the right default here even if it means a build retry.
+retry_curl_strict() {
+  local url="$1" out="$2"
+  if ! retry_curl "$url" "$out"; then
+    log "FATAL: required asset fetch failed: $url"
+    return 1
+  fi
+  if [[ ! -s "$out" ]]; then
+    log "FATAL: required asset is empty after fetch: $out (url=$url)"
+    return 1
+  fi
+  return 0
+}
+
+# retry <max-attempts> <base-backoff-seconds> <cmd...> — generic outer
+# retry with linear backoff (30, 60, 90... for base=30). Deduplicates
+# the three hand-copied dnf retry loops custom-kernel carried (review
+# P3). For dnf installs that should clean metadata between attempts,
+# wrap the command in `bash -c`.
+retry() {
+  local max=$1 base=$2 n=1
+  shift 2
+  while ! "$@"; do
+    if (( n >= max )); then
+      log "retry FAILED after ${max} attempts: $*"
+      return 1
+    fi
+    log "retry: attempt ${n} failed; sleeping $(( n * base ))s: $*"
+    sleep $(( n * base ))
+    n=$(( n + 1 ))
+  done
+  return 0
+}
+
+# NOTE on trap-based cleanup in build scripts: deliberately ABSENT.
+# A failed RUN discards the whole container layer, so half-restored
+# state (moved kernel hooks, remounted /proc/sys, tmpdirs) can never
+# ship. Documented once here so it stops being re-litigated at every
+# review.
+
+# Cached, exported globals used across sections. Defined here once so
+# every sub-script gets the same value without recomputing.
+export FEDORA_VER="${FEDORA_VER:-$(rpm -E %fedora 2>/dev/null || echo 44)}"
+export BUILD_DATE="${BUILD_DATE:-$(date -u +%Y%m%d)}"
+
+# SOURCE_DATE_EPOCH for every build step (2026-10-03). rpm >= 4.18 writes
+# it, instead of the wall clock, as the install time of each package it
+# installs, so the rpmdb stops differing between two builds of the same
+# content (it was a layer of its own, 40 MiB, on every update). The value
+# is the newest install time already in the rpmdb: on the first step
+# that is the base image's, and every later step finds the same number
+# (our own installs carry it), so it moves only when the base does.
+# build-margine-extensions.sh computes it the same way.
+if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
+  SOURCE_DATE_EPOCH="$(rpm -qa --qf '%{INSTALLTIME}\n' 2>/dev/null | sort -n | tail -n1)"
+  [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]] && export SOURCE_DATE_EPOCH || unset SOURCE_DATE_EPOCH
+fi
+
+# --- Third-party signing keys: verify fingerprints before trusting a repo --
+# Moved here from custom-kernel/install.sh (2026-08-25) so 15-devstack can
+# pin the Docker and Microsoft repo keys the same way. The RPMFusion and
+# NVIDIA constants stay in custom-kernel, the Docker/VS Code ones in
+# 15-devstack: each script owns the fingerprints it consumes.
+# gpg comes from the base image (gnupg2); nothing to install at build time.
+# GNUPGHOME is pinned explicitly because buildah RUN starts from a bare
+# environment: gpg wants a home directory it can create, and the first
+# build to try this failed with an empty fingerprint and no explanation,
+# because stderr was being thrown away. It is not thrown away now.
+key_fingerprint() {
+  local out
+  export GNUPGHOME="${GNUPGHOME:-/run/margine-gnupg}"
+  mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+  if ! out="$(gpg --batch --no-options --show-keys --with-colons "$1" 2>&1)"; then
+    err "gpg could not read $1:"
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    return 1
+  fi
+  printf '%s\n' "$out" | awk -F: '/^fpr:/{print $10; exit}'
+}
+
+verify_key_fpr() {
+  local file="$1" expected="$2" label="$3" actual
+  if [[ ! -f "$file" ]]; then
+    err "$label: expected key file $file, not found"
+    return 1
+  fi
+  actual="$(key_fingerprint "$file")" || actual=""
+  if [[ "$actual" != "$expected" ]]; then
+    err "$label: GPG key fingerprint mismatch, refusing to build"
+    err "  expected: $expected"
+    err "  on disk:  ${actual:-<unreadable>}"
+    return 1
+  fi
+  log "$label: key fingerprint verified ($expected)"
+  return 0
+}
+
+# Verifies the key files a rpmfusion-<flavor>-release RPM just dropped in
+# /etc/pki/rpm-gpg. Called BEFORE any package is pulled from those repos,
+# which is the only moment the check is worth anything.
+verify_rpmfusion_keys() {
+  local ver flavor fprvar rc=0
+  ver="$(rpm -E %fedora)"
+  for flavor in "$@"; do
+    fprvar="RPMFUSION_${flavor^^}_FPR"
+    verify_key_fpr \
+      "/etc/pki/rpm-gpg/RPM-GPG-KEY-rpmfusion-${flavor}-fedora-${ver}" \
+      "${!fprvar}" "rpmfusion-${flavor}" || rc=1
+  done
+  return $rc
+}
+
+# regenerate_initramfs <kver>
+# Write /usr/lib/modules/<kver>/initramfs.img so that the same packages give
+# the same bytes whatever the build date (2026-10-16). Every daily update used
+# to re-download the whole 297 MB initramfs layer although its files were
+# identical day to day: only timestamps differed (the kernel modules are
+# re-signed on every build, so they carry the build time) and the build date
+# in initrd-release, which dracut copies from os-release's PRETTY_NAME.
+#   - --reproducible with SOURCE_DATE_EPOCH = the kernel package's build time
+#     clamps every timestamp dracut would take from the build
+#   - os-release is handed to dracut without the "(YYYYMMDD)" in PRETTY_NAME
+#     and restored right after; the installed system keeps the dated name
+regenerate_initramfs() {
+  local kver="$1" dir="/usr/lib/modules/$1" osr=/usr/lib/os-release epoch saved rc=0
+  command -v zstd >/dev/null || { err "zstd missing: dracut would silently gzip the initramfs"; return 1; }
+  epoch=$(rpm -qf --qf '%{BUILDTIME}\n' "$dir/vmlinuz" | head -n1)
+  [[ "$epoch" =~ ^[0-9]+$ ]] || { err "no build time for the package owning $dir/vmlinuz"; return 1; }
+  saved=$(mktemp)
+  cp -p "$osr" "$saved"
+  sed -i -E 's/^(PRETTY_NAME=".*) \([0-9]{8}\)"$/\1"/' "$osr"
+  DRACUT_NO_XATTR=1 SOURCE_DATE_EPOCH="$epoch" dracut --force --zstd --reproducible \
+      --no-hostonly --no-hostonly-cmdline --add ostree --kver "$kver" \
+      "$dir/initramfs.img" || rc=$?
+  cp -p "$saved" "$osr"
+  rm -f "$saved"
+  return "$rc"
+}

@@ -13,9 +13,10 @@ RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
     --mount=type=tmpfs,dst=/tmp \
     /ctx/build.sh
 
-RUN --mount=type=cache,dst=/var/cache/libdnf5 \
-    --mount=type=cache,dst=/var/cache/rpm-ostree \
-    --mount=type=bind,from=ctx,source=/,target=/ctx \
+RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
+    --mount=type=cache,dst=/var/cache \
+    --mount=type=cache,dst=/var/log \
+    --mount=type=tmpfs,dst=/tmp \
     /ctx/cachyos-kernel-installer.sh
 
 # Verify final image and contents are correct.
